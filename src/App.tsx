@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
 import { 
   Shield, 
   ShieldAlert, 
@@ -28,10 +29,21 @@ const PROTOCOLS = [
   { id: 'MALWARE', port: 666, color: 'bg-red-500', risk: 'Critical' },
 ] as const;
 
+const ALERT_TYPES = [
+  'Malware Detected',
+  'DDoS Attack',
+  'SSH Brute Force',
+  'SQL Injection',
+  'Port Scanning',
+  'Unauthorized Access',
+  'Suspicious Traffic',
+] as const;
+
 type Action = 'ALLOW' | 'BLOCK';
 type FirewallMode = 'BLACKLIST' | 'WHITELIST';
 type Risk = 'Low' | 'Medium' | 'High' | 'Critical';
 type PacketStatus = 'PENDING' | Action;
+type AlertType = typeof ALERT_TYPES[number];
 
 type Rule = {
   id: number;
@@ -59,6 +71,17 @@ type TrafficLog = {
   risk: Risk;
 };
 
+type ThreatAlert = {
+  id: number;
+  type: AlertType;
+  sourceIp: string;
+  protocol: string;
+  risk: Risk;
+  action: Action;
+  timestamp: string;
+  visible: boolean;
+};
+
 type Stats = {
   allowed: number;
   blocked: number;
@@ -75,16 +98,146 @@ const INITIAL_RULES: Rule[] = [
   { id: 1, protocol: 'ANY', sourceIp: 'ANY', action: 'ALLOW', description: 'Default Allow All' },
 ];
 
+const SEVERITY_STYLES: Record<Risk, {
+  label: string;
+  card: string;
+  text: string;
+  border: string;
+  glow: string;
+  badge: string;
+}> = {
+  Critical: {
+    label: 'CRITICAL',
+    card: 'from-red-950/95 to-slate-950/95',
+    text: 'text-red-200',
+    border: 'border-red-500/70',
+    glow: 'shadow-[0_0_36px_rgba(239,68,68,0.42)]',
+    badge: 'bg-red-500 text-white',
+  },
+  High: {
+    label: 'HIGH',
+    card: 'from-orange-950/95 to-slate-950/95',
+    text: 'text-orange-200',
+    border: 'border-orange-500/70',
+    glow: 'shadow-[0_0_32px_rgba(249,115,22,0.38)]',
+    badge: 'bg-orange-500 text-white',
+  },
+  Medium: {
+    label: 'MEDIUM',
+    card: 'from-amber-950/95 to-slate-950/95',
+    text: 'text-amber-200',
+    border: 'border-amber-400/70',
+    glow: 'shadow-[0_0_28px_rgba(245,158,11,0.34)]',
+    badge: 'bg-amber-400 text-slate-950',
+  },
+  Low: {
+    label: 'LOW',
+    card: 'from-blue-950/95 to-slate-950/95',
+    text: 'text-blue-200',
+    border: 'border-blue-400/70',
+    glow: 'shadow-[0_0_26px_rgba(96,165,250,0.3)]',
+    badge: 'bg-blue-400 text-slate-950',
+  },
+};
+
+const getThreatType = (packet: Packet): AlertType => {
+  if (packet.protocol === 'MALWARE') return 'Malware Detected';
+  if (packet.protocol === 'SSH') return 'SSH Brute Force';
+  if (packet.protocol === 'HTTP') return packet.sourceIp.startsWith('192.168.') ? 'SQL Injection' : 'Suspicious Traffic';
+  if (packet.protocol === 'HTTPS') return 'Unauthorized Access';
+  if (packet.protocol === 'ICMP') return 'DDoS Attack';
+  if (packet.protocol === 'FTP' || packet.protocol === 'RDP') return 'Port Scanning';
+  return 'Suspicious Traffic';
+};
+
+const shouldTriggerAlert = (packet: Packet, action: Action) => (
+  action === 'BLOCK' ||
+  packet.risk === 'High' ||
+  packet.risk === 'Critical' ||
+  packet.sourceIp.startsWith('192.168.')
+);
+
 const App = () => {
   const [rules, setRules] = useState<Rule[]>(INITIAL_RULES);
   const [packets, setPackets] = useState<Packet[]>([]);
   const [logs, setLogs] = useState<TrafficLog[]>([]);
+  const [alerts, setAlerts] = useState<ThreatAlert[]>([]);
   const [stats, setStats] = useState<Stats>({ allowed: 0, blocked: 0, threats: 0 });
   const [isRunning, setIsRunning] = useState(true);
   const [newRule, setNewRule] = useState<NewRule>({ protocol: 'HTTP', sourceIp: '', action: 'BLOCK' });
   const [firewallMode, setFirewallMode] = useState<FirewallMode>('BLACKLIST'); // BLACKLIST (Allow all except...) or WHITELIST (Block all except...)
+  const [soundEnabled, setSoundEnabled] = useState(false);
+  const [firewallAlerting, setFirewallAlerting] = useState(false);
 
   const packetIdRef = useRef(0);
+  const alertIdRef = useRef(0);
+  const firewallPulseTimeoutRef = useRef<number | null>(null);
+
+  const activeAlerts = alerts.filter(alert => alert.visible);
+  const latestAlert = alerts[0];
+  const severitySummary = useMemo(() => {
+    return alerts.reduce<Record<Risk, number>>((summary, alert) => {
+      summary[alert.risk] += 1;
+      return summary;
+    }, { Low: 0, Medium: 0, High: 0, Critical: 0 });
+  }, [alerts]);
+
+  const dismissAlert = (id: number) => {
+    setAlerts(prev => prev.map(alert => (
+      alert.id === id ? { ...alert, visible: false } : alert
+    )));
+  };
+
+  const playAlertSound = () => {
+    if (!soundEnabled) return;
+
+    const AudioContextClass = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) return;
+
+    const audioContext = new AudioContextClass();
+    const oscillator = audioContext.createOscillator();
+    const gain = audioContext.createGain();
+
+    oscillator.type = 'sine';
+    oscillator.frequency.setValueAtTime(720, audioContext.currentTime);
+    oscillator.frequency.exponentialRampToValueAtTime(360, audioContext.currentTime + 0.22);
+    gain.gain.setValueAtTime(0.001, audioContext.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.12, audioContext.currentTime + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + 0.24);
+    oscillator.connect(gain);
+    gain.connect(audioContext.destination);
+    oscillator.start();
+    oscillator.stop(audioContext.currentTime + 0.26);
+  };
+
+  const triggerAlert = (packet: Packet, action: Action) => {
+    const id = alertIdRef.current++;
+    const alert: ThreatAlert = {
+      id,
+      type: getThreatType(packet),
+      sourceIp: packet.sourceIp,
+      protocol: packet.protocol,
+      risk: packet.risk,
+      action,
+      timestamp: new Date().toLocaleTimeString(),
+      visible: true,
+    };
+
+    setAlerts(prev => [alert, ...prev].slice(0, 25));
+    setStats(s => ({ ...s, threats: s.threats + 1 }));
+    setFirewallAlerting(true);
+    playAlertSound();
+
+    if (firewallPulseTimeoutRef.current) {
+      window.clearTimeout(firewallPulseTimeoutRef.current);
+    }
+
+    firewallPulseTimeoutRef.current = window.setTimeout(() => {
+      setFirewallAlerting(false);
+    }, 2600);
+
+    window.setTimeout(() => dismissAlert(id), 6500);
+  };
 
   // Fungsi untuk mengevaluasi paket berdasarkan aturan
   const evaluatePacket = (packet: Packet): Action => {
@@ -154,9 +307,12 @@ const App = () => {
             } else {
               setStats(s => ({ 
                 ...s, 
-                blocked: s.blocked + 1,
-                threats: p.risk === 'Critical' || p.risk === 'High' ? s.threats + 1 : s.threats
+                blocked: s.blocked + 1
               }));
+            }
+
+            if (shouldTriggerAlert(p, decision)) {
+              triggerAlert(p, decision);
             }
 
             setLogs(prevLogs => [{
@@ -200,12 +356,77 @@ const App = () => {
   const resetSim = () => {
     setPackets([]);
     setLogs([]);
+    setAlerts([]);
     setStats({ allowed: 0, blocked: 0, threats: 0 });
     setRules(INITIAL_RULES);
+    setFirewallAlerting(false);
   };
+
+  useEffect(() => {
+    return () => {
+      if (firewallPulseTimeoutRef.current) {
+        window.clearTimeout(firewallPulseTimeoutRef.current);
+      }
+    };
+  }, []);
 
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 p-8 font-sans">
+      <div className="fixed right-6 top-6 z-50 flex w-[360px] flex-col gap-3">
+        <AnimatePresence>
+          {activeAlerts.slice(0, 3).map(alert => {
+            const severity = SEVERITY_STYLES[alert.risk];
+
+            return (
+              <motion.div
+                key={alert.id}
+                initial={{ opacity: 0, x: 80, scale: 0.96 }}
+                animate={{ opacity: 1, x: 0, scale: 1 }}
+                exit={{ opacity: 0, x: 80, scale: 0.96 }}
+                transition={{ type: 'spring', stiffness: 320, damping: 28 }}
+                className={`overflow-hidden rounded-xl border bg-gradient-to-br ${severity.card} ${severity.border} ${severity.glow} backdrop-blur`}
+              >
+                <div className="border-b border-white/10 px-4 py-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2">
+                      <AlertTriangle className="blink-warning text-red-400" size={18} />
+                      <p className={`text-sm font-black uppercase tracking-widest ${severity.text}`}>[!] {alert.type}</p>
+                    </div>
+                    <span className={`rounded px-2 py-0.5 text-[10px] font-black ${severity.badge}`}>{severity.label}</span>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-2 px-4 py-3 text-xs">
+                  <span className="text-slate-500">Source</span>
+                  <span className="font-mono text-slate-100">{alert.sourceIp}</span>
+                  <span className="text-slate-500">Protocol</span>
+                  <span className="font-bold text-cyan-300">{alert.protocol}</span>
+                  <span className="text-slate-500">Action</span>
+                  <span className={alert.action === 'BLOCK' ? 'font-black text-red-300' : 'font-black text-green-300'}>
+                    {alert.action === 'BLOCK' ? 'BLOCKED' : 'ALLOWED'}
+                  </span>
+                  <span className="text-slate-500">Timestamp</span>
+                  <span className="font-mono text-slate-300">{alert.timestamp}</span>
+                </div>
+                <div className="flex items-center justify-end gap-2 border-t border-white/10 px-4 py-3">
+                  <button
+                    className="rounded-md border border-cyan-400/40 px-3 py-1.5 text-xs font-bold text-cyan-200 transition hover:bg-cyan-400/10"
+                    onClick={() => document.getElementById('alert-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                  >
+                    View Details
+                  </button>
+                  <button
+                    className="rounded-md border border-slate-600 px-3 py-1.5 text-xs font-bold text-slate-300 transition hover:bg-slate-700"
+                    onClick={() => dismissAlert(alert.id)}
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </motion.div>
+            );
+          })}
+        </AnimatePresence>
+      </div>
+
       {/* Header */}
       <header className="max-w-6xl mx-auto mb-8 flex flex-row justify-between items-center gap-4">
         <div>
@@ -250,8 +471,8 @@ const App = () => {
               </div>
 
               <div className="flex flex-col items-center gap-2">
-                <div className={`p-6 rounded-2xl border-2 transition-all duration-500 ${stats.threats > 5 ? 'bg-red-900/40 border-red-500 shadow-[0_0_20px_rgba(239,68,68,0.3)]' : 'bg-slate-700 border-cyan-500'}`}>
-                  {stats.threats > 5 ? <ShieldAlert className="text-red-500 animate-pulse" size={48} /> : <ShieldCheck className="text-cyan-400" size={48} />}
+                <div className={`p-6 rounded-2xl border-2 transition-all duration-500 ${firewallAlerting ? 'firewall-threat-pulse bg-red-900/50 border-red-500 shadow-[0_0_36px_rgba(239,68,68,0.55)]' : stats.threats > 5 ? 'bg-orange-900/30 border-orange-500 shadow-[0_0_24px_rgba(249,115,22,0.28)]' : 'bg-slate-700 border-cyan-500'}`}>
+                  {firewallAlerting || stats.threats > 5 ? <ShieldAlert className="text-red-500 animate-pulse" size={48} /> : <ShieldCheck className="text-cyan-400" size={48} />}
                 </div>
                 <span className="text-xs font-bold uppercase tracking-widest text-cyan-500">Firewall Node</span>
               </div>
@@ -363,6 +584,91 @@ const App = () => {
 
         {/* Kolom Kanan: Firewall Policy Manager */}
         <div className="space-y-6">
+          <div id="alert-panel" className="overflow-hidden rounded-2xl border border-red-500/30 bg-slate-950/80 shadow-[0_0_38px_rgba(239,68,68,0.16)]">
+            <div className="border-b border-red-500/20 bg-gradient-to-r from-red-950/70 via-slate-900 to-orange-950/40 px-6 py-4">
+              <div className="flex items-center justify-between">
+                <h3 className="flex items-center gap-2 font-bold">
+                  <AlertTriangle className="blink-warning text-red-400" size={18} />
+                  Alert Notification System
+                </h3>
+                <button
+                  onClick={() => setSoundEnabled(enabled => !enabled)}
+                  className={`rounded-md border px-3 py-1.5 text-[11px] font-black uppercase tracking-wider transition ${
+                    soundEnabled
+                      ? 'border-cyan-400/50 bg-cyan-400/10 text-cyan-200'
+                      : 'border-slate-700 text-slate-500 hover:text-slate-300'
+                  }`}
+                >
+                  Sound {soundEnabled ? 'On' : 'Off'}
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 p-4">
+              <div className="rounded-xl border border-slate-700 bg-slate-900/80 p-3">
+                <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500">Active Alerts</p>
+                <p className="mt-1 text-2xl font-black text-red-300">{activeAlerts.length}</p>
+              </div>
+              <div className="rounded-xl border border-slate-700 bg-slate-900/80 p-3">
+                <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500">Total Threats</p>
+                <p className="mt-1 text-2xl font-black text-orange-300">{stats.threats}</p>
+              </div>
+              <div className="col-span-2 rounded-xl border border-slate-700 bg-slate-900/80 p-3">
+                <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500">Last Detection</p>
+                {latestAlert ? (
+                  <div className="mt-2 flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-black text-slate-100">{latestAlert.type}</p>
+                      <p className="font-mono text-xs text-slate-500">{latestAlert.sourceIp} / {latestAlert.protocol}</p>
+                    </div>
+                    <span className={`shrink-0 rounded px-2 py-1 text-[10px] font-black ${SEVERITY_STYLES[latestAlert.risk].badge}`}>
+                      {SEVERITY_STYLES[latestAlert.risk].label}
+                    </span>
+                  </div>
+                ) : (
+                  <p className="mt-2 text-sm text-slate-500">No detection yet</p>
+                )}
+              </div>
+            </div>
+
+            <div className="px-4 pb-4">
+              <p className="mb-3 text-[10px] font-bold uppercase tracking-widest text-slate-500">Threat Severity Summary</p>
+              <div className="grid grid-cols-4 gap-2">
+                {(['Critical', 'High', 'Medium', 'Low'] as Risk[]).map(risk => (
+                  <div key={risk} className={`rounded-lg border ${SEVERITY_STYLES[risk].border} bg-slate-900/70 p-2 text-center`}>
+                    <p className={`text-lg font-black ${SEVERITY_STYLES[risk].text}`}>{severitySummary[risk]}</p>
+                    <p className="text-[9px] font-bold uppercase text-slate-500">{risk}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="border-t border-slate-800 px-4 py-4">
+              <p className="mb-3 text-[10px] font-bold uppercase tracking-widest text-slate-500">Alert History</p>
+              <div className="max-h-44 space-y-2 overflow-y-auto pr-2 custom-scrollbar">
+                {alerts.length === 0 ? (
+                  <div className="rounded-lg border border-dashed border-slate-700 p-4 text-center text-xs text-slate-500">
+                    Menunggu ancaman realtime...
+                  </div>
+                ) : (
+                  alerts.slice(0, 8).map(alert => (
+                    <div key={alert.id} className="rounded-lg border border-slate-800 bg-slate-900/70 p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="truncate text-xs font-black text-slate-200">{alert.type}</p>
+                        <span className={`rounded px-1.5 py-0.5 text-[9px] font-black ${SEVERITY_STYLES[alert.risk].badge}`}>
+                          {SEVERITY_STYLES[alert.risk].label}
+                        </span>
+                      </div>
+                      <div className="mt-1 flex justify-between gap-2 text-[11px] text-slate-500">
+                        <span className="font-mono">{alert.sourceIp}</span>
+                        <span>{alert.timestamp}</span>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
           
           {/* Konfigurasi Aturan */}
           <div className="bg-slate-800 rounded-2xl border border-slate-700 overflow-hidden flex flex-col h-full shadow-xl">
@@ -481,6 +787,25 @@ const App = () => {
         .custom-scrollbar::-webkit-scrollbar { width: 4px; }
         .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
         .custom-scrollbar::-webkit-scrollbar-thumb { background: #475569; border-radius: 10px; }
+        .blink-warning {
+          animation: blink-warning 0.9s ease-in-out infinite;
+          filter: drop-shadow(0 0 10px rgba(248, 113, 113, 0.85));
+        }
+        .firewall-threat-pulse {
+          animation: firewall-threat-pulse 1.05s ease-in-out infinite;
+        }
+        @keyframes blink-warning {
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50% { opacity: 0.38; transform: scale(1.12); }
+        }
+        @keyframes firewall-threat-pulse {
+          0%, 100% {
+            box-shadow: 0 0 24px rgba(239, 68, 68, 0.45), inset 0 0 16px rgba(239, 68, 68, 0.16);
+          }
+          50% {
+            box-shadow: 0 0 54px rgba(249, 115, 22, 0.7), inset 0 0 28px rgba(248, 113, 113, 0.24);
+          }
+        }
       `}</style>
     </div>
   );
