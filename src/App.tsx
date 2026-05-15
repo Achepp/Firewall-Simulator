@@ -205,9 +205,9 @@ const App = () => {
   };
 
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 p-4 md:p-8 font-sans">
+    <div className="min-h-screen bg-slate-900 text-slate-100 p-8 font-sans">
       {/* Header */}
-      <header className="max-w-6xl mx-auto mb-8 flex flex-col md:flex-row justify-between items-center gap-4">
+      <header className="max-w-6xl mx-auto mb-8 flex flex-row justify-between items-center gap-4">
         <div>
           <h1 className="text-3xl font-bold flex items-center gap-3">
             <Shield className="text-cyan-400 w-8 h-8" />
@@ -232,10 +232,10 @@ const App = () => {
         </div>
       </header>
 
-      <main className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-8">
+      <main className="max-w-6xl mx-auto grid grid-cols-3 gap-8">
         
         {/* Kolom Kiri: Dashboard Visualisasi */}
-        <div className="lg:col-span-2 space-y-6">
+        <div className="col-span-2 space-y-6">
           
           {/* Monitor Visualisasi */}
           <div className="bg-slate-800 rounded-2xl p-6 border border-slate-700 shadow-xl relative overflow-hidden h-80">
